@@ -3,6 +3,7 @@ import asyncio
 import base64
 import logging
 import os
+import time
 
 import httpx
 
@@ -11,6 +12,8 @@ log = logging.getLogger("bot")
 BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# Швидкість: minimal / low / medium / high. Порожньо = рівень за замовчуванням моделі.
+REASONING = os.getenv("REASONING_EFFORT", "").strip().lower()
 RETRY_STATUS = {429, 500, 502, 503, 504}
 ATTEMPTS = 3
 
@@ -37,12 +40,18 @@ async def ask_model(system, user_text, images=None):
             {"role": "user", "content": content},
         ],
     }
+    if REASONING:
+        payload["reasoning_effort"] = REASONING
+
     headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
     busy_msg = "Сервіс ШІ тимчасово перевантажений, спробуй за хвилину."
     last_status = None
+    started = time.monotonic()
+    attempt = 0
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
-        for attempt in range(1, ATTEMPTS + 1):
+        while attempt < ATTEMPTS:
+            attempt += 1
             try:
                 r = await client.post(f"{BASE_URL}/chat/completions", headers=headers, json=payload)
                 last_status = r.status_code
@@ -52,13 +61,24 @@ async def ask_model(system, user_text, images=None):
                     r.raise_for_status()
                     text = (r.json()["choices"][0]["message"].get("content") or "").strip()
                     if text:
+                        log.info(
+                            "ШІ відповів за %.1f с (спроба %d, зображень: %d, reasoning: %s)",
+                            time.monotonic() - started,
+                            attempt,
+                            len(images or []),
+                            payload.get("reasoning_effort", "за замовчуванням"),
+                        )
                         return text
                     log.warning("ШІ повернув порожню відповідь (спроба %d/%d)", attempt, ATTEMPTS)
             except httpx.HTTPStatusError as e:
-                log.error("ШІ помилка %s: %s", e.response.status_code, e.response.text[:300])
-                raise AIError(
-                    f"ШІ повернув помилку (код {e.response.status_code}). Подробиці в логах Railway."
-                )
+                code = e.response.status_code
+                log.error("ШІ помилка %s: %s", code, e.response.text[:300])
+                if code == 400 and "reasoning_effort" in payload:
+                    log.warning("Модель не приймає reasoning_effort, повторюю без нього")
+                    payload.pop("reasoning_effort", None)
+                    attempt -= 1
+                    continue
+                raise AIError(f"ШІ повернув помилку (код {code}). Подробиці в логах Railway.")
             except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
                 log.warning("Збій запиту до ШІ: %s (спроба %d/%d)", type(e).__name__, attempt, ATTEMPTS)
             if attempt < ATTEMPTS:
