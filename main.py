@@ -1,4 +1,4 @@
-"""NavigatorMia_bot, етап 1: кнопки, режими, скріни, матриця часу, щоденник пари."""
+"""NavigatorMia_bot: режими, скріни, матриця часу, журнал без стирання, результати угод."""
 import asyncio
 import logging
 import os
@@ -17,7 +17,7 @@ from telegram.ext import (
 )
 
 import memory
-from ai import MODEL, AIError, ask_model
+from ai import MODELS, AIError, ask_model
 from matrix import matrix_snapshot, now_platform, upcoming_junctions
 from prompts import SYSTEM_PROMPT
 
@@ -38,8 +38,10 @@ SYSTEM = SYSTEM_PROMPT + (
 
 BTN_START = "▶️ Початок роботи"
 BTN_END = "⏹ Кінець роботи"
-BTN_SWITCH = "🔄 Змінити пару/режим"
-MAIN_KB = ReplyKeyboardMarkup([[BTN_START, BTN_END], [BTN_SWITCH]], resize_keyboard=True)
+BTN_SWITCH = "🔄 Змінити режим"
+OLD_BTN_SWITCH = "🔄 Змінити пару/режим"  # стара назва кнопки, поки клавіатура не оновилась
+BTN_STATS = "📊 Статистика"
+MAIN_KB = ReplyKeyboardMarkup([[BTN_START, BTN_END], [BTN_SWITCH, BTN_STATS]], resize_keyboard=True)
 
 
 def ikb(rows):
@@ -49,9 +51,9 @@ def ikb(rows):
 
 
 MODE_KB = ikb([[("🎯 Мій напрямок", "mode:mine")], [("🤖 Аналіз від бота", "mode:bot")]])
-PAIR_KB = ikb([[("🆕 Нова пара", "pair:new"), ("↩️ Продовжити пару", "pair:cont")]])
 DIR_KB = ikb([[("⬆️ Вгору", "dir:UP"), ("⬇️ Вниз", "dir:DOWN")]])
-END_KB = ikb([[("Так, завершити", "end:yes"), ("Ні", "end:no")]])
+END_KB = ikb([[("Так, пауза", "end:yes"), ("Ні", "end:no")]])
+RESULT_LABELS = [("win", "✅ Зайшла"), ("loss", "❌ Не зайшла"), ("skip", "⏭ Пропустила")]
 
 MODE_NAMES = {"mine": "Мій напрямок", "bot": "Аналіз від бота"}
 DIR_NAMES = {"UP": "ВГОРУ", "DOWN": "ВНИЗ"}
@@ -60,13 +62,23 @@ ALBUMS = {}  # media_group_id -> {"images": [...], "caption": str}
 WARNED = set()
 
 
+def result_kb(entry_id, current=None):
+    def button(key, label):
+        mark = "✔ " if key == current else ""
+        return InlineKeyboardButton(mark + label, callback_data=f"res:{entry_id}:{key}")
+
+    return InlineKeyboardMarkup(
+        [[button(*RESULT_LABELS[0]), button(*RESULT_LABELS[1])], [button(*RESULT_LABELS[2])]]
+    )
+
+
 def allowed(update):
     user = update.effective_user
     return bool(user and user.id in ALLOWED)
 
 
 def is_ready(st):
-    if not st.get("working") or not st.get("mode") or not st.get("pair"):
+    if not st.get("working") or not st.get("mode"):
         return False
     if st["mode"] == "mine" and not st.get("direction"):
         return False
@@ -74,7 +86,7 @@ def is_ready(st):
 
 
 def ready_text(st):
-    s = f"Готово ✅ Режим: {MODE_NAMES.get(st.get('mode'), '?')}, пара: {st.get('pair')}"
+    s = f"Готово ✅ Режим: {MODE_NAMES.get(st.get('mode'), '?')}"
     if st.get("mode") == "mine":
         s += f", напрямок: {DIR_NAMES.get(st.get('direction'), '?')}"
     return s + ".\nНадсилай скріни (можна кілька одним альбомом) або пиши питання."
@@ -84,12 +96,8 @@ async def ask_next_step(message, st):
     """Показує наступний крок налаштування."""
     if not st.get("mode"):
         await message.reply_text("Обери режим:", reply_markup=MODE_KB)
-    elif not st.get("pair"):
-        await message.reply_text("Яка пара?", reply_markup=PAIR_KB)
     elif st["mode"] == "mine" and not st.get("direction"):
-        await message.reply_text(
-            f"Пара: {st['pair']}. Який напрямок ти бачиш?", reply_markup=DIR_KB
-        )
+        await message.reply_text("Який напрямок ти бачиш?", reply_markup=DIR_KB)
     else:
         await message.reply_text(ready_text(st))
 
@@ -114,7 +122,7 @@ async def on_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     st = context.user_data
-    for key in ("mode", "pair", "direction", "awaiting_pair", "pair_choices"):
+    for key in ("mode", "direction", "direction_at"):
         st.pop(key, None)
     st["working"] = True
     await update.message.reply_text("Обери режим:", reply_markup=MODE_KB)
@@ -124,8 +132,14 @@ async def on_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     await update.message.reply_text(
-        "Завершити роботу й очистити історію пар за сьогодні?", reply_markup=END_KB
+        "Поставити бота на паузу? Записи й статистика збережуться.", reply_markup=END_KB
     )
+
+
+async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await update.message.reply_text(memory.stats_text())
 
 
 # ---------- inline-кнопки ----------
@@ -139,51 +153,41 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
 
     if data.startswith("mode:"):
-        st["mode"] = data.split(":", 1)[1]
+        mode = data.split(":", 1)[1]
+        if mode not in MODE_NAMES:
+            return
+        st["mode"] = mode
         st["working"] = True
         st.pop("direction", None)
-        await q.edit_message_text(f"Режим: {MODE_NAMES.get(st['mode'], '?')}")
-        await ask_next_step(q.message, st)
-
-    elif data == "pair:new":
-        st["awaiting_pair"] = True
-        await q.edit_message_text("Нова пара")
-        await q.message.reply_text("Напиши назву пари (наприклад CHF/JPY OTC).")
-
-    elif data == "pair:cont":
-        pairs = memory.list_pairs()
-        if not pairs:
-            st["awaiting_pair"] = True
-            await q.edit_message_text("Продовжити пару")
-            await q.message.reply_text(
-                "Сьогодні ще немає збережених пар. Напиши назву нової пари."
-            )
-        else:
-            st["pair_choices"] = pairs
-            rows = [[(p, f"pairsel:{i}")] for i, p in enumerate(pairs)]
-            await q.edit_message_text("Обери пару:", reply_markup=ikb(rows))
-
-    elif data.startswith("pairsel:"):
-        choices = st.get("pair_choices") or []
-        try:
-            st["pair"] = choices[int(data.split(":", 1)[1])]
-        except (ValueError, IndexError):
-            await q.edit_message_text("Не вдалося обрати пару, спробуй ще раз.")
-            return
-        st.pop("direction", None)
-        await q.edit_message_text(f"Пара: {st['pair']} (історія за сьогодні збережена)")
+        st.pop("direction_at", None)
+        await q.edit_message_text(f"Режим: {MODE_NAMES[mode]}")
         await ask_next_step(q.message, st)
 
     elif data.startswith("dir:"):
         st["direction"] = data.split(":", 1)[1]
+        st["direction_at"] = now_platform().strftime("%H:%M:%S")
         await q.edit_message_text(f"Напрямок: {DIR_NAMES.get(st['direction'], '?')}")
         await ask_next_step(q.message, st)
 
+    elif data.startswith("res:"):
+        try:
+            _, sid, key = data.split(":")
+            saved = memory.set_result(int(sid), key)
+        except ValueError:
+            saved = False
+        if not saved:
+            await q.message.reply_text("Не вдалося записати результат.")
+            return
+        try:
+            await q.edit_message_reply_markup(reply_markup=result_kb(int(sid), key))
+        except Exception:
+            pass  # те саме значення натиснули вдруге
+
     elif data == "end:yes":
-        memory.clear_all()
-        st.clear()
+        for key in ("working", "mode", "direction", "direction_at"):
+            st.pop(key, None)
         await q.edit_message_text(
-            "Роботу завершено, історію пар очищено. Добраніч 🌙\nЩоб почати знову, натисни ▶️"
+            "Пауза ⏸ Записи й статистика збережені.\nЩоб продовжити, натисни ▶️ Початок роботи."
         )
 
     elif data == "end:no":
@@ -197,13 +201,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     st = context.user_data
     text = (update.message.text or "").strip()
-
-    if st.get("awaiting_pair"):
-        st["awaiting_pair"] = False
-        st["pair"] = memory.normalize_pair(text)
-        st.pop("direction", None)
-        await ask_next_step(update.message, st)
-        return
 
     if not st.get("working"):
         await update.message.reply_text("Натисни ▶️ Початок роботи.", reply_markup=MAIN_KB)
@@ -230,20 +227,17 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # у режимі «мій напрямок» напрям можна змінити підписом до скріна
     if st.get("mode") == "mine":
         low = caption.lower()
-        if "вгору" in low:
-            st["direction"] = "UP"
-        elif "вниз" in low:
-            st["direction"] = "DOWN"
+        new_dir = "UP" if "вгору" in low else "DOWN" if "вниз" in low else None
+        if new_dir:
+            st["direction"] = new_dir
+            st["direction_at"] = now_platform().strftime("%H:%M:%S")
 
-    if not st.get("working"):
+    if not st.get("working") or not is_ready(st):
         if gid is None or gid not in WARNED:
-            await msg.reply_text("Натисни ▶️ Початок роботи.", reply_markup=MAIN_KB)
-        if gid:
-            WARNED.add(gid)
-        return
-    if not is_ready(st):
-        if gid is None or gid not in WARNED:
-            await ask_next_step(msg, st)
+            if not st.get("working"):
+                await msg.reply_text("Натисни ▶️ Початок роботи.", reply_markup=MAIN_KB)
+            else:
+                await ask_next_step(msg, st)
         if gid:
             WARNED.add(gid)
             if len(WARNED) > 100:
@@ -284,55 +278,59 @@ async def finish_album(app, gid, chat_id, st):
 
 def build_user_text(st, images, caption):
     now = now_platform()
-    pair = st.get("pair", "?")
     lines = []
     if st.get("mode") == "mine":
         lines.append("РЕЖИМ: МІЙ НАПРЯМОК")
-        lines.append(f"НАПРЯМОК КОРИСТУВАЧКИ: {DIR_NAMES.get(st.get('direction'), 'не задано')}")
+        lines.append(
+            f"НАПРЯМОК КОРИСТУВАЧКИ: {DIR_NAMES.get(st.get('direction'), 'не задано')} "
+            f"(задано о {st.get('direction_at', '?')})"
+        )
     else:
         lines.append("РЕЖИМ: АНАЛІЗ ВІД БОТА (напрям визначаєш ти)")
-    lines.append(f"ПАРА: {pair}")
-    lines.append("")
-    lines.append(matrix_snapshot(now))
-    lines.append("")
-    lines.append(upcoming_junctions(now))
-    lines.append("")
-    hist = memory.get_recent(pair, 6)
+    lines += ["", matrix_snapshot(now), "", upcoming_junctions(now), ""]
+
+    hist = memory.get_recent()
     if hist:
-        lines.append("ЩОДЕННИК ПАРИ ЗА СЬОГОДНІ (від старого до нового):")
+        lines.append(
+            f"ЩОДЕННИК (останні {memory.RECENT_HOURS:g} год, усі пари; "
+            "використовуй лише записи тієї самої пари, що на скріні):"
+        )
         lines.extend(hist)
     else:
-        lines.append("ЩОДЕННИК ПАРИ: порожньо (це перший аналіз по цій парі сьогодні)")
+        lines.append("ЩОДЕННИК: за останні години записів немає.")
     lines.append("")
+
     if images:
         lines.append(
             f"СКРІНІВ У ЗАПИТІ: {len(images)}. Запит створено о {now:%H:%M:%S}, "
-            "відповідь ШІ займе 10-40 с. Якщо скріни з різних таймфреймів, визнач, який на якому."
+            "відповідь ШІ займе 10-40 с. Пару визнач зі скріна. "
+            "Якщо скріни з різних таймфреймів, визнач, який на якому."
         )
         if caption:
             lines.append(f"ПІДПИС КОРИСТУВАЧКИ: {caption}")
     else:
+        pair = memory.last_pair()
+        if pair:
+            lines.append(f"Остання пара в щоденнику: {pair}")
         lines.append(f"СКРІНА НЕМАЄ, це звичайне повідомлення: {caption}")
     return "\n".join(lines)
 
 
-def extract_summary(text):
-    for line in reversed(text.splitlines()):
-        if line.strip().upper().startswith("ПІДСУМОК"):
-            return (line.split(":", 1)[1] if ":" in line else line).strip()[:300]
-    return " ".join(text.split())[:300]
-
-
-async def send_long(bot, chat_id, text):
+async def send_long(bot, chat_id, text, reply_markup=None):
     text = text.strip()
+    chunks = []
     while text:
         chunk = text[:4000]
         if len(text) > 4000:
             cut = chunk.rfind("\n")
             if cut > 1000:
                 chunk = chunk[:cut]
-        await bot.send_message(chat_id, chunk)
+        chunks.append(chunk)
         text = text[len(chunk):].lstrip("\n")
+    for i, chunk in enumerate(chunks):
+        await bot.send_message(
+            chat_id, chunk, reply_markup=reply_markup if i == len(chunks) - 1 else None
+        )
 
 
 async def run_analysis(app, chat_id, st, images, caption):
@@ -347,11 +345,17 @@ async def run_analysis(app, chat_id, st, images, caption):
         except AIError as e:
             await app.bot.send_message(chat_id, str(e))
             return
+
+        markup = None
         if images:
-            memory.add_entry(
-                st.get("pair", "?"), st.get("mode"), st.get("direction"), extract_summary(answer)
+            pair = memory.parse_pair(answer) or memory.last_pair() or "НЕВІДОМА ПАРА"
+            verdict = memory.parse_verdict(answer)
+            entry_id = memory.add_entry(
+                pair, st.get("mode"), st.get("direction"), verdict, memory.extract_summary(answer)
             )
-        await send_long(app.bot, chat_id, answer)
+            if verdict in ("UP", "DOWN"):
+                markup = result_kb(entry_id)  # кнопки для відмітки результату угоди
+        await send_long(app.bot, chat_id, answer, markup)
     except Exception:
         log.exception("Помилка аналізу")
         try:
@@ -381,7 +385,8 @@ def main():
     app.add_handler(CommandHandler("id", on_id))
     app.add_handler(MessageHandler(filters.Text([BTN_START]), on_start))
     app.add_handler(MessageHandler(filters.Text([BTN_END]), on_end))
-    app.add_handler(MessageHandler(filters.Text([BTN_SWITCH]), on_switch))
+    app.add_handler(MessageHandler(filters.Text([BTN_SWITCH, OLD_BTN_SWITCH]), on_switch))
+    app.add_handler(MessageHandler(filters.Text([BTN_STATS]), on_stats))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
@@ -389,7 +394,7 @@ def main():
 
     log.info(
         "Бот стартує (AI: %s, дозволених користувачів: %d, сховище: %s)",
-        MODEL, len(ALLOWED), memory.DATA_DIR,
+        ", ".join(MODELS), len(ALLOWED), memory.DATA_DIR,
     )
     app.run_polling(drop_pending_updates=True)
 
